@@ -13,17 +13,44 @@ class ImportsControllerTest < ActionDispatch::IntegrationTest
 
     assert_response :success
 
+    assert_select "button[data-action='click->privacy-mode#toggle']", count: 1
+    assert_select "[data-controller='bulk-select']"
+    assert_select "[data-bulk-select-target='selectionBar']"
+    assert_select "form#bulk-delete-form"
+    assert_select "input[data-bulk-select-target='row'][form='bulk-delete-form']", count: @user.family.imports.where(type: Import::TYPES).count
+    assert_select "#bulk-delete-form button[type='submit']"
+    assert_select "input[data-bulk-select-target='row']", count: @user.family.imports.where(type: Import::TYPES).count
+
     @user.family.imports.ordered.each do |import|
       assert_select "#" + dom_id(import), count: 1
     end
   end
 
-  test "gets new" do
+  test "shows PDF file names as privacy-sensitive values" do
+    import = imports(:pdf_processed)
+    import.pdf_file.attach(
+      io: StringIO.new(file_fixture("imports/sample_bank_statement.pdf").binread),
+      filename: "checking-january.pdf",
+      content_type: "application/pdf"
+    )
+
+    get imports_url
+
+    assert_response :success
+    assert_select "##{dom_id(import)} span.privacy-sensitive", text: "checking-january.pdf"
+  end
+
+  test "gets new with an aggregate upload size warning" do
+    adapter = mock("vector_store_adapter")
+    adapter.stubs(:supported_extensions).returns(%w[.pdf .txt])
+    VectorStore::Registry.stubs(:adapter).returns(adapter)
+
     get new_import_url
 
     assert_response :success
-
     assert_select "turbo-frame#modal"
+    assert_select "form[data-controller='batch-upload-warning']"
+    assert_select "input[type='file'][data-action='change->batch-upload-warning#upload']"
   end
 
   test "cancel marks a lost import as failed" do
@@ -113,6 +140,40 @@ class ImportsControllerTest < ActionDispatch::IntegrationTest
     assert_equal I18n.t("imports.create.document_uploaded"), flash[:notice]
   end
 
+  test "uploads multiple documents independently" do
+    adapter = mock("vector_store_adapter")
+    adapter.stubs(:supported_extensions).returns(%w[.pdf .txt])
+    VectorStore::Registry.stubs(:adapter).returns(adapter)
+
+    family_document = family_documents(:tax_return)
+    Family.any_instance.expects(:upload_document).with do |file_content:, filename:, **|
+      assert_equal "notes.txt", filename
+      assert_equal "plain text", file_content
+      true
+    end.returns(family_document)
+
+    valid_pdf = file_fixture_upload("imports/sample_bank_statement.pdf", "application/pdf")
+    text_file = Rack::Test::UploadedFile.new(
+      StringIO.new("plain text"),
+      "text/plain",
+      original_filename: "notes.txt"
+    )
+
+    assert_difference [ "AccountStatement.count", "Import.where(type: 'PdfImport').count" ], 1 do
+      assert_enqueued_jobs 1, only: ProcessPdfJob do
+        post imports_url, params: {
+          import: {
+            type: "DocumentImport",
+            import_file: [ valid_pdf, text_file ]
+          }
+        }
+      end
+    end
+
+    assert_redirected_to imports_url
+    assert_equal "1 PDF is being processed. You will receive an email when analysis is complete. 1 document uploaded successfully.", flash[:notice]
+  end
+
   test "summary renders the import outcome for a pdf import" do
     get summary_import_url(imports(:pdf_with_rows))
 
@@ -150,6 +211,80 @@ class ImportsControllerTest < ActionDispatch::IntegrationTest
     assert_not created_import.pdf_file.attached?
     assert_redirected_to import_url(created_import)
     assert_equal I18n.t("imports.create.pdf_processing"), flash[:notice]
+  end
+
+  test "recognizes a PDF by extension with an unrecognized MIME type in a batch" do
+    adapter = mock("vector_store_adapter")
+    adapter.stubs(:supported_extensions).returns(%w[.pdf])
+    VectorStore::Registry.stubs(:adapter).returns(adapter)
+    source = file_fixture("imports/sample_bank_statement.pdf").binread
+    files = [ "first.pdf", "second.pdf" ].each_with_index.map do |filename, index|
+      uploaded_file(filename: filename, content_type: "application/octet-stream", content: source + "\n% copy #{index}")
+    end
+
+    assert_difference "Import.where(type: 'PdfImport').count", 2 do
+      assert_enqueued_jobs 2, only: ProcessPdfJob do
+        post imports_url, params: { import: { type: "DocumentImport", import_file: files } }
+      end
+    end
+  end
+
+  test "reports batch PDFs whose processing jobs could not be scheduled" do
+    adapter = mock("vector_store_adapter")
+    adapter.stubs(:supported_extensions).returns(%w[.pdf])
+    VectorStore::Registry.stubs(:adapter).returns(adapter)
+    PdfImport.any_instance.stubs(:process_with_ai_later).returns(false)
+    source = file_fixture("imports/sample_bank_statement.pdf").binread
+    files = [ "first.pdf", "second.pdf" ].each_with_index.map do |filename, index|
+      uploaded_file(filename: filename, content_type: "application/pdf", content: source + "\n% copy #{index}")
+    end
+
+    assert_difference "Import.where(type: 'PdfImport').count", 2 do
+      assert_no_enqueued_jobs only: ProcessPdfJob do
+        post imports_url, params: { import: { type: "DocumentImport", import_file: files } }
+      end
+    end
+    assert_equal %w[pending pending], PdfImport.order(:created_at).last(2).map(&:status)
+    assert_includes flash[:alert], "first.pdf"
+    assert_includes flash[:alert], "second.pdf"
+  end
+
+  test "reports filename when a vector-store upload returns nil" do
+    adapter = mock("vector_store_adapter")
+    adapter.stubs(:supported_extensions).returns(%w[.txt])
+    VectorStore::Registry.stubs(:adapter).returns(adapter)
+    Family.any_instance.expects(:upload_document).twice.returns(nil)
+
+    post imports_url, params: { import: { type: "DocumentImport", import_file: [
+      uploaded_file(filename: "first.txt", content_type: "text/plain", content: "first"),
+      uploaded_file(filename: "second.txt", content_type: "text/plain", content: "second")
+    ] } }
+
+    assert_includes flash[:alert], "first.txt"
+    assert_includes flash[:alert], "second.txt"
+  end
+
+  test "accepts document batches above the aggregate size warning" do
+    files = (1..11).map do |index|
+      uploaded_file(filename: "notes-#{index}.txt", content_type: "text/plain", content: "notes")
+    end
+    ActionDispatch::Http::UploadedFile.any_instance.stubs(:size).returns(3.megabytes)
+    adapter = mock("vector_store_adapter")
+    adapter.stubs(:supported_extensions).returns(%w[.txt])
+    VectorStore::Registry.stubs(:adapter).returns(adapter)
+    Family.any_instance.expects(:upload_document).times(files.size).returns("uploaded")
+
+    post imports_url, params: { import: { type: "DocumentImport", import_file: files } }
+
+    assert_equal I18n.t("imports.create.document_uploaded_many", count: files.size), flash[:notice]
+    assert_nil flash[:alert]
+  end
+
+  test "bulk deletion rejects requests above the operation limit" do
+    delete destroy_all_imports_url, params: { bulk_delete: { import_ids: Array.new(Import::MAX_BATCH_DELETE_IMPORTS + 1) { imports(:transaction).id } } }
+
+    assert_equal I18n.t("imports.destroy_all.limit", count: Import::MAX_BATCH_DELETE_IMPORTS), flash[:alert]
+    assert imports(:transaction).persisted?
   end
 
   test "uploads pdf import through account statement" do
@@ -199,11 +334,23 @@ class ImportsControllerTest < ActionDispatch::IntegrationTest
       )
     )
 
+    assert_no_difference "Import.where(type: 'PdfImport').count" do
+      post imports_url, params: {
+        import: {
+          import_file: file_fixture_upload("imports/sample_bank_statement.pdf", "application/pdf")
+        }
+      }
+    end
+
+    assert_redirected_to new_import_url
+    assert_equal I18n.t("imports.create.duplicate_pdf_unconfirmed"), flash[:alert]
+
     assert_no_difference "AccountStatement.count" do
       assert_difference "Import.where(type: 'PdfImport').count", 1 do
         post imports_url, params: {
           import: {
-            import_file: file_fixture_upload("imports/sample_bank_statement.pdf", "application/pdf")
+            import_file: file_fixture_upload("imports/sample_bank_statement.pdf", "application/pdf"),
+            allow_duplicate_upload: "true"
           }
         }
       end
@@ -411,6 +558,70 @@ class ImportsControllerTest < ActionDispatch::IntegrationTest
     assert_redirected_to imports_path
   end
 
+  test "deletes a completed import with no committed data" do
+    import = imports(:pdf_processed)
+
+    assert_difference "Import.count", -1 do
+      delete import_url(import)
+    end
+
+    assert_redirected_to imports_path
+  end
+
+  test "does not delete a completed import with committed data" do
+    import = imports(:transaction)
+    import.update!(status: :complete)
+    entries(:transaction).update!(import: import)
+
+    assert_no_difference "Import.count" do
+      delete import_url(import)
+    end
+
+    assert_redirected_to imports_path
+    assert_equal I18n.t("imports.destroy.not_deletable"), flash[:alert]
+  end
+
+  test "bulk deletes selected imports in the current family" do
+    imports = [ imports(:transaction), imports(:trade) ]
+
+    assert_difference "Import.count", -2 do
+      delete destroy_all_imports_url, params: {
+        bulk_delete: { import_ids: imports.map(&:id) }
+      }
+    end
+
+    assert_redirected_to imports_path
+    assert_equal "2 imports deleted.", flash[:notice]
+  end
+
+  test "bulk deletion skips completed imports with committed data" do
+    import = imports(:transaction)
+    import.update!(status: :complete)
+    entries(:transaction).update!(import: import)
+
+    assert_no_difference "Import.count" do
+      delete destroy_all_imports_url, params: {
+        bulk_delete: { import_ids: [ import.id ] }
+      }
+    end
+
+    assert_redirected_to imports_path
+    assert_equal I18n.t("imports.destroy_all.not_deletable", count: 1), flash[:alert]
+  end
+
+  test "bulk deletion is scoped to the current family" do
+    other_family_import = Import.create!(family: families(:empty), type: "TransactionImport")
+
+    assert_no_difference "Import.count" do
+      delete destroy_all_imports_url, params: {
+        bulk_delete: { import_ids: [ other_family_import.id ] }
+      }
+    end
+
+    assert_redirected_to imports_path
+    assert_equal "No deletable imports were selected.", flash[:alert]
+  end
+
   test "respects SURE_IMPORT_MAX_NDJSON_SIZE_MB when creating Sure import (#3010)" do
     configured_limit = 2.megabytes
     SureImport.stubs(:max_ndjson_size).returns(configured_limit)
@@ -432,6 +643,146 @@ class ImportsControllerTest < ActionDispatch::IntegrationTest
 
     assert_redirected_to new_import_url
     assert_equal I18n.t("imports.create.file_too_large", max_size: configured_limit / 1.megabyte), flash[:alert]
+  end
+
+  test "shows a friendly warning when a Sure import's transactions reference merchants missing from the export (#3113)" do
+    import = @user.family.imports.create!(type: "SureImport")
+    ndjson = [
+      { type: "Account", data: {
+        id: "account-1", name: "Old Export Checking", balance: "1000.00", currency: "USD",
+        accountable_type: "Depository", accountable: { subtype: "checking" }
+      } },
+      { type: "Transaction", data: {
+        id: "transaction-1", account_id: "account-1", merchant_id: "merchant-never-exported",
+        date: "2024-01-15", amount: "42.50", name: "Amazon purchase", currency: "USD"
+      } }
+    ].map(&:to_json).join("\n")
+    import.ndjson_file.attach(io: StringIO.new(ndjson), filename: "all.ndjson", content_type: "application/x-ndjson")
+    import.sync_ndjson_rows_count!
+
+    get import_url(import)
+
+    assert_response :success
+    assert_includes response.body, I18n.t("imports.ready.missing_merchant_warning_title")
+  end
+
+  test "does not show the missing merchant warning for a Sure import with no unresolved merchant references" do
+    import = @user.family.imports.create!(type: "SureImport")
+    ndjson = [
+      { type: "Account", data: {
+        id: "account-1", name: "Clean Export Checking", balance: "1000.00", currency: "USD",
+        accountable_type: "Depository", accountable: { subtype: "checking" }
+      } }
+    ].map(&:to_json).join("\n")
+    import.ndjson_file.attach(io: StringIO.new(ndjson), filename: "all.ndjson", content_type: "application/x-ndjson")
+    import.sync_ndjson_rows_count!
+
+    get import_url(import)
+
+    assert_response :success
+    assert_not_includes response.body, I18n.t("imports.ready.missing_merchant_warning_title")
+  end
+
+  test "explains that unnamed recurring transactions with a missing merchant will be skipped" do
+    import = @user.family.imports.create!(type: "SureImport")
+    ndjson = [
+      { type: "Account", data: {
+        id: "account-1", name: "Checking", balance: "1000.00", currency: "USD",
+        accountable_type: "Depository", accountable: { subtype: "checking" }
+      } },
+      { type: "RecurringTransaction", data: {
+        id: "recurring-1", account_id: "account-1", merchant_id: "merchant-never-exported",
+        amount: "11.99", currency: "USD", expected_day_of_month: 28,
+        last_occurrence_date: "2026-08-28", next_expected_date: "2026-09-28"
+      } }
+    ].map(&:to_json).join("\n")
+    import.ndjson_file.attach(io: StringIO.new(ndjson), filename: "all.ndjson", content_type: "application/x-ndjson")
+    import.sync_ndjson_rows_count!
+
+    get import_url(import)
+
+    assert_response :success
+    assert_includes response.body, I18n.t("imports.ready.missing_merchant_warning_title")
+    assert_includes response.body, I18n.t("imports.ready.skipped_recurring_description", count: 1).squish
+    assert_not_includes response.body, "merchant reference in this file"
+  end
+
+  test "shows a friendly notice when a Sure import reuses existing categories, tags or merchants by name (#3113)" do
+    @user.family.categories.create!(name: "Groceries", color: "#407706", lucide_icon: "shopping-basket")
+    import = @user.family.imports.create!(type: "SureImport")
+    ndjson = [
+      { type: "Category", data: { id: "category-1", name: "Groceries" } }
+    ].map(&:to_json).join("\n")
+    import.ndjson_file.attach(io: StringIO.new(ndjson), filename: "all.ndjson", content_type: "application/x-ndjson")
+    import.sync_ndjson_rows_count!
+
+    get import_url(import)
+
+    assert_response :success
+    assert_includes response.body, I18n.t("imports.ready.reused_taxonomy_notice_title")
+  end
+
+  test "does not show the reused taxonomy notice for a Sure import with no name collisions" do
+    import = @user.family.imports.create!(type: "SureImport")
+    ndjson = [
+      { type: "Category", data: { id: "category-1", name: "A Brand New Category Name" } }
+    ].map(&:to_json).join("\n")
+    import.ndjson_file.attach(io: StringIO.new(ndjson), filename: "all.ndjson", content_type: "application/x-ndjson")
+    import.sync_ndjson_rows_count!
+
+    get import_url(import)
+
+    assert_response :success
+    assert_not_includes response.body, I18n.t("imports.ready.reused_taxonomy_notice_title")
+  end
+
+  test "shows the differences when an existing provider merchant differs from the Sure import file" do
+    ProviderMerchant.create!(name: "AMZN MKTP", source: "plaid", website_url: "https://amazon.com")
+    import = @user.family.imports.create!(type: "SureImport")
+    ndjson = [
+      { type: "Account", data: {
+        id: "account-1", name: "Checking", balance: "1000.00", currency: "USD",
+        accountable_type: "Depository", accountable: { subtype: "checking" }
+      } },
+      { type: "ProviderMerchant", data: { id: "pm-1", name: "AMZN MKTP", source: "plaid", website_url: "https://amazon.co.uk" } }
+    ].map(&:to_json).join("\n")
+    import.ndjson_file.attach(io: StringIO.new(ndjson), filename: "all.ndjson", content_type: "application/x-ndjson")
+    import.sync_ndjson_rows_count!
+
+    get import_url(import)
+
+    assert_response :success
+    assert_includes response.body, I18n.t("imports.ready.provider_merchant_diff_title")
+    assert_includes response.body, "AMZN MKTP"
+    assert_includes response.body, "keeping https://amazon.com, file has https://amazon.co.uk"
+  end
+
+  test "does not show the provider merchant differences notice without a difference" do
+    import = @user.family.imports.create!(type: "SureImport")
+    ndjson = [
+      { type: "Account", data: {
+        id: "account-1", name: "Checking", balance: "1000.00", currency: "USD",
+        accountable_type: "Depository", accountable: { subtype: "checking" }
+      } }
+    ].map(&:to_json).join("\n")
+    import.ndjson_file.attach(io: StringIO.new(ndjson), filename: "all.ndjson", content_type: "application/x-ndjson")
+    import.sync_ndjson_rows_count!
+
+    get import_url(import)
+
+    assert_response :success
+    assert_not_includes response.body, I18n.t("imports.ready.provider_merchant_diff_title")
+  end
+
+  test "import ready notices use singular and plural wording" do
+    {
+      "imports.ready.missing_merchant_warning_description" => [ "1 merchant reference in this file", "2 merchant references in this file" ],
+      "imports.ready.reused_taxonomy_notice_description" => [ "1 category, tag or merchant", "2 categories, tags or merchants" ],
+      "imports.ready.provider_merchant_diff_description" => [ "1 merchant in this file", "2 merchants in this file" ]
+    }.each do |key, (singular, plural)|
+      assert_includes I18n.t(key, count: 1), singular
+      assert_includes I18n.t(key, count: 2), plural
+    end
   end
 
   test "PDF import account select does not leak unshared family accounts (#1803)" do
